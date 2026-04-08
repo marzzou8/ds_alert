@@ -12,6 +12,11 @@ app = Flask(__name__)
 def home():
     return "Gold Scalping Bot running"
 
+# Fast health check endpoint – responds immediately without heavy work
+@app.route('/health')
+def health():
+    return "OK", 200
+
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
@@ -117,6 +122,7 @@ def run_bot():
         try:
             df = get_oanda_candles()
             if df is None or len(df) < MIN_CANDLES:
+                print("Waiting for enough data...")
                 time.sleep(30)
                 continue
             df = add_indicators(df)
@@ -128,7 +134,8 @@ def run_bot():
                 send_telegram(msg)
                 last_signal_time = now
         except Exception as e:
-            print("Bot error:", e)
+            print("Bot loop error:", e)
+            send_telegram(f"⚠️ Bot error: {str(e)[:100]}")
         time.sleep(60)
 
 if __name__ == "__main__":
