@@ -1,6 +1,5 @@
 setuptools==81.0.0
-wheel==0.45.1
-flask==2.3.3
-requests==2.31.0
-pandas==2.0.3
-numpy==1.24.3
+flask
+requests
+pandas
+numpy
