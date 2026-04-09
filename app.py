@@ -27,9 +27,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Trading parameters
-ATR_STOP_MULT = 1.5
-ATR_TARGET_MULT = 3.0
-SIGNAL_COOLDOWN = 300  # seconds
+ATR_STOP_MULT = 4.0     # Wider stop: 4x ATR
+ATR_TARGET_MULT = 8.0   # Wider target: 8x ATR (1:2 R:R)
+SIGNAL_COOLDOWN = 300    # seconds
 MIN_CANDLES = 200
 
 last_signal_time = 0
@@ -102,22 +102,23 @@ def get_signal(df):
         return "SELL"
     return None
 
+# ========== IMPROVED SL/TP (Option 3: ATR with wider multipliers) ==========
 def calculate_sl_tp(df, signal):
     entry = df['close'].iloc[-1]
     atr = df['atr'].iloc[-1]
     if pd.isna(atr) or atr <= 0:
-        atr = 2.0
+        atr = 2.0  # fallback if ATR not ready
     if signal == "BUY":
         sl = entry - (atr * ATR_STOP_MULT)
         tp = entry + (atr * ATR_TARGET_MULT)
     else:
         sl = entry + (atr * ATR_STOP_MULT)
         tp = entry - (atr * ATR_TARGET_MULT)
-    return round(entry,2), round(sl,2), round(tp,2)
+    return round(entry, 2), round(sl, 2), round(tp, 2)
 
 def run_bot():
     global last_signal_time
-    send_telegram("🚀 Gold Scalping Bot Started (EMA+RSI+BB)")
+    send_telegram("🚀 Gold Scalping Bot Started (EMA+RSI+BB) | SL/TP: 4x/8x ATR")
     while True:
         try:
             df = get_oanda_candles()
@@ -130,7 +131,9 @@ def run_bot():
             now = time.time()
             if signal and (now - last_signal_time) > SIGNAL_COOLDOWN:
                 entry, sl, tp = calculate_sl_tp(df, signal)
-                msg = f"""{signal} XAUUSD\nEntry: {entry}\nSL: {sl}\nTP: {tp}\nRSI: {df['rsi'].iloc[-1]:.1f}"""
+                risk = abs(entry - sl)
+                reward = abs(tp - entry)
+                msg = f"""DS {signal} XAUUSD\nEntry: {entry}\nSL: {sl} ({risk:.2f} pts)\nTP: {tp} ({reward:.2f} pts)\nR:R 1:{reward/risk:.1f}\nRSI: {df['rsi'].iloc[-1]:.1f}"""
                 send_telegram(msg)
                 last_signal_time = now
         except Exception as e:
