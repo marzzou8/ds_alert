@@ -10,9 +10,8 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Gold Scalping Bot running"
+    return "P&F Gold Scalping Bot running"
 
-# Fast health check endpoint – responds immediately without heavy work
 @app.route('/health')
 def health():
     return "OK", 200
@@ -21,18 +20,25 @@ def run_server():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-# === CONFIG from environment variables ===
+# === CONFIG ===
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Trading parameters
-ATR_STOP_MULT = 4.0     # Wider stop: 4x ATR
-ATR_TARGET_MULT = 8.0   # Wider target: 8x ATR (1:2 R:R)
-SIGNAL_COOLDOWN = 300    # seconds
-MIN_CANDLES = 200
+# P&F parameters
+BOX_SIZE = 2.0          # $2 per box
+REVERSAL = 3            # 3-box reversal
+SL_BOXES = 4            # stop loss = 4 boxes = $8
+TP_BOXES = 6            # take profit = 6 boxes = $12
+ALERT_AT_BOX = 4        # send alert when 4th box completes
 
-last_signal_time = 0
+last_alert_time = 0
+ALERT_COOLDOWN = 300    # 5 minutes between alerts
+
+# P&F state
+pf_direction = None     # 'X' or 'O'
+pf_boxes = []           # list of box levels in current column
+last_column_boxes = 0   # number of boxes in previous column (for reversal detection)
 
 def send_telegram(msg):
     try:
@@ -45,101 +51,117 @@ def get_oanda_candles():
     url = "https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/candles"
     headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     params = {"granularity": "M1", "count": 200, "price": "M"}
-    r = requests.get(url, headers=headers, params=params, timeout=15)
-    data = r.json()
-    if "candles" not in data:
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        data = r.json()
+        if "candles" not in data:
+            return None
+        rows = []
+        for c in data["candles"]:
+            rows.append({
+                "close": float(c["mid"]["c"]),
+                "high": float(c["mid"]["h"]),
+                "low": float(c["mid"]["l"])
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print("Data error:", e)
         return None
-    rows = []
-    for c in data["candles"]:
-        rows.append({
-            "close": float(c["mid"]["c"]),
-            "high": float(c["mid"]["h"]),
-            "low": float(c["mid"]["l"])
-        })
-    return pd.DataFrame(rows)
 
-def add_indicators(df):
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    df['bb_mid'] = df['close'].rolling(20).mean()
-    df['bb_std'] = df['close'].rolling(20).std()
-    df['bb_lower'] = df['bb_mid'] - 2 * df['bb_std']
-    df['bb_upper'] = df['bb_mid'] + 2 * df['bb_std']
-    df['tr'] = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(abs(df['high'] - df['close'].shift(1)),
-                   abs(df['low'] - df['close'].shift(1)))
-    )
-    df['atr'] = df['tr'].rolling(14).mean()
-    return df
+def update_pf(price, current_direction, current_boxes):
+    """
+    Update P&F chart with new price.
+    Returns (new_direction, new_boxes, alert_sent_flag)
+    """
+    if current_direction is None:
+        # Initialize: first box
+        box_level = round(price / BOX_SIZE) * BOX_SIZE
+        return ('X', [box_level], False)
 
-def get_signal(df):
-    if len(df) < 2:
-        return None
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-    prev_above = prev['ema9'] > prev['ema20']
-    curr_above = curr['ema9'] > curr['ema20']
-    bullish_cross = (not prev_above) and curr_above
-    bearish_cross = prev_above and (not curr_above)
-    above_200 = curr['close'] > curr['ema200']
-    below_200 = curr['close'] < curr['ema200']
-    oversold = curr['rsi'] < 30
-    overbought = curr['rsi'] > 70
-    touch_lower = curr['close'] <= curr['bb_lower']
-    touch_upper = curr['close'] >= curr['bb_upper']
-    if bullish_cross and above_200 and oversold and touch_lower:
-        return "BUY"
-    if bearish_cross and below_200 and overbought and touch_upper:
-        return "SELL"
-    return None
-
-# ========== IMPROVED SL/TP (Option 3: ATR with wider multipliers) ==========
-def calculate_sl_tp(df, signal):
-    entry = df['close'].iloc[-1]
-    atr = df['atr'].iloc[-1]
-    if pd.isna(atr) or atr <= 0:
-        atr = 2.0  # fallback if ATR not ready
-    if signal == "BUY":
-        sl = entry - (atr * ATR_STOP_MULT)
-        tp = entry + (atr * ATR_TARGET_MULT)
-    else:
-        sl = entry + (atr * ATR_STOP_MULT)
-        tp = entry - (atr * ATR_TARGET_MULT)
-    return round(entry, 2), round(sl, 2), round(tp, 2)
+    last_box = current_boxes[-1]
+    if current_direction == 'X':
+        # In uptrend, look for higher high
+        if price >= last_box + BOX_SIZE:
+            # Add another X
+            new_boxes = current_boxes + [last_box + BOX_SIZE]
+            return ('X', new_boxes, False)
+        elif price <= last_box - (REVERSAL * BOX_SIZE):
+            # Reversal to O: need 3-box down move
+            new_box_level = last_box - BOX_SIZE
+            new_boxes = [new_box_level]
+            return ('O', new_boxes, False)
+        else:
+            # No change
+            return (current_direction, current_boxes, False)
+    else:  # current_direction == 'O'
+        if price <= last_box - BOX_SIZE:
+            # Add another O
+            new_boxes = current_boxes + [last_box - BOX_SIZE]
+            return ('O', new_boxes, False)
+        elif price >= last_box + (REVERSAL * BOX_SIZE):
+            # Reversal to X: need 3-box up move
+            new_box_level = last_box + BOX_SIZE
+            new_boxes = [new_box_level]
+            return ('X', new_boxes, False)
+        else:
+            return (current_direction, current_boxes, False)
 
 def run_bot():
-    global last_signal_time
-    send_telegram("🚀 Gold Scalping Bot Started (EMA+RSI+BB) | SL/TP: 4x/8x ATR")
+    global pf_direction, pf_boxes, last_alert_time
+    send_telegram("🚀 P&F Gold Scalping Bot Started | Box=2, Rev=3, Alert at box 4")
+
     while True:
         try:
             df = get_oanda_candles()
-            if df is None or len(df) < MIN_CANDLES:
-                print("Waiting for enough data...")
+            if df is None or len(df) < 10:
                 time.sleep(30)
                 continue
-            df = add_indicators(df)
-            signal = get_signal(df)
-            now = time.time()
-            if signal and (now - last_signal_time) > SIGNAL_COOLDOWN:
-                entry, sl, tp = calculate_sl_tp(df, signal)
-                risk = abs(entry - sl)
-                reward = abs(tp - entry)
-                msg = f"""DS {signal} XAUUSD\nEntry: {entry}\nSL: {sl} ({risk:.2f} pts)\nTP: {tp} ({reward:.2f} pts)\nR:R 1:{reward/risk:.1f}\nRSI: {df['rsi'].iloc[-1]:.1f}"""
-                send_telegram(msg)
-                last_signal_time = now
+
+            # Use the latest close price to update P&F
+            latest_price = df['close'].iloc[-1]
+            new_dir, new_boxes, _ = update_pf(latest_price, pf_direction, pf_boxes)
+
+            # Check if a new column started (direction changed)
+            if pf_direction is not None and new_dir != pf_direction:
+                # New column just started – box count = 1
+                print(f"New {new_dir} column started at price {new_boxes[0]}")
+                # No alert on box 1
+            elif pf_direction == new_dir and len(new_boxes) > len(pf_boxes):
+                # Added a new box to existing column
+                new_box_count = len(new_boxes)
+                print(f"Added {new_dir} box #{new_box_count} at {new_boxes[-1]}")
+                # Send alert when we reach ALERT_AT_BOX (4th box)
+                if new_box_count == ALERT_AT_BOX and (time.time() - last_alert_time) > ALERT_COOLDOWN:
+                    entry_price = new_boxes[-1]  # current box level
+                    if new_dir == 'X':
+                        sl = entry_price - (SL_BOXES * BOX_SIZE)
+                        tp = entry_price + (TP_BOXES * BOX_SIZE)
+                        msg = f"""🔔 BUY XAUUSD (P&F)
+Entry: {entry_price:.2f} (start of box 5)
+SL: {sl:.2f} (4 boxes)
+TP: {tp:.2f} (6 boxes)
+R:R 1:{TP_BOXES/SL_BOXES:.1f}
+Box count: {new_box_count}"""
+                    else:
+                        sl = entry_price + (SL_BOXES * BOX_SIZE)
+                        tp = entry_price - (TP_BOXES * BOX_SIZE)
+                        msg = f"""🔔 SELL XAUUSD (P&F)
+Entry: {entry_price:.2f} (start of box 5)
+SL: {sl:.2f} (4 boxes)
+TP: {tp:.2f} (6 boxes)
+R:R 1:{TP_BOXES/SL_BOXES:.1f}
+Box count: {new_box_count}"""
+                    send_telegram(msg)
+                    last_alert_time = time.time()
+
+            # Update global state
+            pf_direction, pf_boxes = new_dir, new_boxes
+
         except Exception as e:
             print("Bot loop error:", e)
             send_telegram(f"⚠️ Bot error: {str(e)[:100]}")
-        time.sleep(60)
+
+        time.sleep(60)  # check every minute
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
