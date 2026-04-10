@@ -31,14 +31,22 @@ REVERSAL = 3            # 3-box reversal
 SL_BOXES = 4            # stop loss = 4 boxes = $8
 TP_BOXES = 6            # take profit = 6 boxes = $12
 ALERT_AT_BOX = 4        # send alert when 4th box completes
+PROFIT_TRIGGER = 3.0    # dollars – when price moves this much in profit, move SL to BE
 
 last_alert_time = 0
-ALERT_COOLDOWN = 300    # 5 minutes between alerts
+ALERT_COOLDOWN = 300    # 5 minutes between signals
 
 # P&F state
 pf_direction = None     # 'X' or 'O'
 pf_boxes = []           # list of box levels in current column
-last_column_boxes = 0   # number of boxes in previous column (for reversal detection)
+
+# Trade monitoring state
+trade_active = False
+trade_entry = 0.0
+trade_direction = None   # 'BUY' or 'SELL'
+trade_sl = 0.0
+trade_tp = 0.0
+trade_be_triggered = False   # whether we already moved SL to BE
 
 def send_telegram(msg):
     try:
@@ -80,35 +88,73 @@ def update_pf(price, current_direction, current_boxes):
 
     last_box = current_boxes[-1]
     if current_direction == 'X':
-        # In uptrend, look for higher high
         if price >= last_box + BOX_SIZE:
-            # Add another X
             new_boxes = current_boxes + [last_box + BOX_SIZE]
             return ('X', new_boxes, False)
         elif price <= last_box - (REVERSAL * BOX_SIZE):
-            # Reversal to O: need 3-box down move
             new_box_level = last_box - BOX_SIZE
             new_boxes = [new_box_level]
             return ('O', new_boxes, False)
         else:
-            # No change
             return (current_direction, current_boxes, False)
     else:  # current_direction == 'O'
         if price <= last_box - BOX_SIZE:
-            # Add another O
             new_boxes = current_boxes + [last_box - BOX_SIZE]
             return ('O', new_boxes, False)
         elif price >= last_box + (REVERSAL * BOX_SIZE):
-            # Reversal to X: need 3-box up move
             new_box_level = last_box + BOX_SIZE
             new_boxes = [new_box_level]
             return ('X', new_boxes, False)
         else:
             return (current_direction, current_boxes, False)
 
+def monitor_trade(price):
+    """Check active trade, send alerts, update SL to BE if profit reached."""
+    global trade_active, trade_sl, trade_be_triggered, trade_entry, trade_direction, trade_tp
+
+    if not trade_active:
+        return
+
+    profit = price - trade_entry if trade_direction == 'BUY' else trade_entry - price
+
+    # Check if TP hit
+    if trade_direction == 'BUY' and price >= trade_tp:
+        msg = f"✅ TP HIT! Trade closed in profit.\nEntry: {trade_entry}\nTP: {trade_tp}\nProfit: +{price - trade_entry:.2f}"
+        send_telegram(msg)
+        trade_active = False
+        return
+    elif trade_direction == 'SELL' and price <= trade_tp:
+        msg = f"✅ TP HIT! Trade closed in profit.\nEntry: {trade_entry}\nTP: {trade_tp}\nProfit: +{trade_entry - price:.2f}"
+        send_telegram(msg)
+        trade_active = False
+        return
+
+    # Check if SL hit (original or BE)
+    if trade_direction == 'BUY' and price <= trade_sl:
+        msg = f"❌ SL HIT! Trade closed.\nEntry: {trade_entry}\nSL: {trade_sl}\nLoss: {trade_entry - price:.2f}"
+        send_telegram(msg)
+        trade_active = False
+        return
+    elif trade_direction == 'SELL' and price >= trade_sl:
+        msg = f"❌ SL HIT! Trade closed.\nEntry: {trade_entry}\nSL: {trade_sl}\nLoss: {price - trade_entry:.2f}"
+        send_telegram(msg)
+        trade_active = False
+        return
+
+    # Check if profit trigger reached and not yet moved SL to BE
+    if not trade_be_triggered and profit >= PROFIT_TRIGGER:
+        # Move SL to break-even
+        old_sl = trade_sl
+        trade_sl = trade_entry
+        trade_be_triggered = True
+        msg = f"🔹P&F Profit +{profit:.2f} reached. SL moved to BE ({trade_entry:.2f}).\nEntry: {trade_entry}\nOld SL: {old_sl:.2f}"
+        send_telegram(msg)
+
 def run_bot():
     global pf_direction, pf_boxes, last_alert_time
-    send_telegram("🚀 P&F Gold Scalping Bot Started | Box=2, Rev=3, Alert at box 4")
+    global trade_active, trade_entry, trade_direction, trade_sl, trade_tp, trade_be_triggered
+
+    send_telegram("🚀 P&F Gold Scalping Bot Started | Box=2, Rev=3, Alert at box 4 | Trade monitoring ON")
 
     while True:
         try:
@@ -117,45 +163,61 @@ def run_bot():
                 time.sleep(30)
                 continue
 
-            # Use the latest close price to update P&F
             latest_price = df['close'].iloc[-1]
-            new_dir, new_boxes, _ = update_pf(latest_price, pf_direction, pf_boxes)
 
-            # Check if a new column started (direction changed)
-            if pf_direction is not None and new_dir != pf_direction:
-                # New column just started – box count = 1
-                print(f"New {new_dir} column started at price {new_boxes[0]}")
-                # No alert on box 1
-            elif pf_direction == new_dir and len(new_boxes) > len(pf_boxes):
-                # Added a new box to existing column
-                new_box_count = len(new_boxes)
-                print(f"Added {new_dir} box #{new_box_count} at {new_boxes[-1]}")
-                # Send alert when we reach ALERT_AT_BOX (4th box)
-                if new_box_count == ALERT_AT_BOX and (time.time() - last_alert_time) > ALERT_COOLDOWN:
-                    entry_price = new_boxes[-1]  # current box level
-                    if new_dir == 'X':
-                        sl = entry_price - (SL_BOXES * BOX_SIZE)
-                        tp = entry_price + (TP_BOXES * BOX_SIZE)
-                        msg = f"""🔔 BUY XAUUSD (P&F)
+            # === MONITOR ACTIVE TRADE ===
+            monitor_trade(latest_price)
+
+            # === P&F SIGNAL GENERATION (only if no active trade) ===
+            if not trade_active:
+                new_dir, new_boxes, _ = update_pf(latest_price, pf_direction, pf_boxes)
+
+                # Check if a new column started or a new box added
+                if pf_direction is not None and new_dir != pf_direction:
+                    # New column just started – box count = 1
+                    print(f"New {new_dir} column started at price {new_boxes[0]}")
+                elif pf_direction == new_dir and len(new_boxes) > len(pf_boxes):
+                    new_box_count = len(new_boxes)
+                    print(f"Added {new_dir} box #{new_box_count} at {new_boxes[-1]}")
+                    # Send alert when we reach ALERT_AT_BOX
+                    if new_box_count == ALERT_AT_BOX and (time.time() - last_alert_time) > ALERT_COOLDOWN:
+                        entry_price = new_boxes[-1]  # current box level
+                        if new_dir == 'X':
+                            sl = entry_price - (SL_BOXES * BOX_SIZE)
+                            tp = entry_price + (TP_BOXES * BOX_SIZE)
+                            msg = f"""🔔 BUY XAUUSD (P&F)
 Entry: {entry_price:.2f} (start of box 5)
 SL: {sl:.2f} (4 boxes)
 TP: {tp:.2f} (6 boxes)
 R:R 1:{TP_BOXES/SL_BOXES:.1f}
 Box count: {new_box_count}"""
-                    else:
-                        sl = entry_price + (SL_BOXES * BOX_SIZE)
-                        tp = entry_price - (TP_BOXES * BOX_SIZE)
-                        msg = f"""🔔 SELL XAUUSD (P&F)
+                        else:
+                            sl = entry_price + (SL_BOXES * BOX_SIZE)
+                            tp = entry_price - (TP_BOXES * BOX_SIZE)
+                            msg = f"""🔔 SELL XAUUSD (P&F)
 Entry: {entry_price:.2f} (start of box 5)
 SL: {sl:.2f} (4 boxes)
 TP: {tp:.2f} (6 boxes)
 R:R 1:{TP_BOXES/SL_BOXES:.1f}
 Box count: {new_box_count}"""
-                    send_telegram(msg)
-                    last_alert_time = time.time()
+                        send_telegram(msg)
+                        last_alert_time = time.time()
 
-            # Update global state
-            pf_direction, pf_boxes = new_dir, new_boxes
+                        # === ACTIVATE TRADE MONITORING ===
+                        trade_active = True
+                        trade_entry = entry_price
+                        trade_direction = 'BUY' if new_dir == 'X' else 'SELL'
+                        trade_sl = sl
+                        trade_tp = tp
+                        trade_be_triggered = False
+                        send_telegram(f"📊 Trade monitoring ACTIVE for {trade_direction} @ {trade_entry}")
+
+                # Update global P&F state
+                pf_direction, pf_boxes = new_dir, new_boxes
+            else:
+                # Trade active – still need to update P&F state for future signals but don't generate new ones
+                new_dir, new_boxes, _ = update_pf(latest_price, pf_direction, pf_boxes)
+                pf_direction, pf_boxes = new_dir, new_boxes
 
         except Exception as e:
             print("Bot loop error:", e)
