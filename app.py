@@ -1,4 +1,3 @@
-
 from flask import Flask
 import threading
 import requests
@@ -27,29 +26,29 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # P&F parameters
-BOX_SIZE = 2.0          # $2 per box
-REVERSAL = 3            # 3-box reversal
-SL_BOXES = 4            # stop loss = 4 boxes = $8
-TP_BOXES = 6            # take profit = 6 boxes = $12
-ALERT_AT_BOX = 4        # send alert when 4th box completes
-PROFIT_TRIGGER = 3.0    # dollars – when price moves this much in profit, move SL to BE
+BOX_SIZE = 2.0
+REVERSAL = 3
+SL_BOXES = 4
+TP_BOXES = 6
+ALERT_AT_BOX = 4
+PROFIT_TRIGGER = 3.0
 
 last_alert_time = 0
-ALERT_COOLDOWN = 300    # 5 minutes between signals
+ALERT_COOLDOWN = 300
 
 # P&F state
-pf_direction = None     # 'X' or 'O'
-pf_boxes = []           # list of box levels in current column
+pf_direction = None
+pf_boxes = []
 
 # Trade monitoring state
 trade_active = False
 trade_entry = 0.0
-trade_direction = None   # 'BUY' or 'SELL'
+trade_direction = None
 trade_sl = 0.0
 trade_tp = 0.0
-trade_be_triggered = False   # whether we already moved SL to BE
+trade_be_triggered = False
 
-# === NEW: EMA helper ===
+# === EMA helper ===
 def compute_ema(df, period=50):
     return df['close'].ewm(span=period, adjust=False).mean()
 
@@ -97,7 +96,7 @@ def update_pf(price, current_direction, current_boxes):
             return ('O', new_boxes, False)
         else:
             return (current_direction, current_boxes, False)
-    else:  # current_direction == 'O'
+    else:  # 'O'
         if price <= last_box - BOX_SIZE:
             new_boxes = current_boxes + [last_box - BOX_SIZE]
             return ('O', new_boxes, False)
@@ -117,24 +116,20 @@ def monitor_trade(price):
     profit = price - trade_entry if trade_direction == 'BUY' else trade_entry - price
 
     if trade_direction == 'BUY' and price >= trade_tp:
-        msg = f"✅ TP HIT! Trade closed in profit.\nEntry: {trade_entry}\nTP: {trade_tp}\nProfit: +{price - trade_entry:.2f}"
-        send_telegram(msg)
+        send_telegram(f"✅ TP HIT! Entry {trade_entry}, TP {trade_tp}, Profit +{price - trade_entry:.2f}")
         trade_active = False
         return
     elif trade_direction == 'SELL' and price <= trade_tp:
-        msg = f"✅ TP HIT! Trade closed in profit.\nEntry: {trade_entry}\nTP: {trade_tp}\nProfit: +{trade_entry - price:.2f}"
-        send_telegram(msg)
+        send_telegram(f"✅ TP HIT! Entry {trade_entry}, TP {trade_tp}, Profit +{trade_entry - price:.2f}")
         trade_active = False
         return
 
     if trade_direction == 'BUY' and price <= trade_sl:
-        msg = f"❌ SL HIT! Trade closed.\nEntry: {trade_entry}\nSL: {trade_sl}\nLoss: {trade_entry - price:.2f}"
-        send_telegram(msg)
+        send_telegram(f"❌ SL HIT! Entry {trade_entry}, SL {trade_sl}, Loss {trade_entry - price:.2f}")
         trade_active = False
         return
     elif trade_direction == 'SELL' and price >= trade_sl:
-        msg = f"❌ SL HIT! Trade closed.\nEntry: {trade_entry}\nSL: {trade_sl}\nLoss: {price - trade_entry:.2f}"
-        send_telegram(msg)
+        send_telegram(f"❌ SL HIT! Entry {trade_entry}, SL {trade_sl}, Loss {price - trade_entry:.2f}")
         trade_active = False
         return
 
@@ -142,14 +137,13 @@ def monitor_trade(price):
         old_sl = trade_sl
         trade_sl = trade_entry
         trade_be_triggered = True
-        msg = f"🔹P&F Profit +{profit:.2f} reached. SL moved to BE ({trade_entry:.2f}).\nEntry: {trade_entry}\nOld SL: {old_sl:.2f}"
-        send_telegram(msg)
+        send_telegram(f"🔹 Profit +{profit:.2f} reached. SL moved to BE {trade_entry:.2f}. Old SL {old_sl:.2f}")
 
 def run_bot():
     global pf_direction, pf_boxes, last_alert_time
     global trade_active, trade_entry, trade_direction, trade_sl, trade_tp, trade_be_triggered
 
-    send_telegram("🚀 P&F Gold Scalping Bot Started | Box=2, Rev=3, Alert at box 4 | EMA filter ON | Trade monitoring ON")
+    send_telegram("🚀 Bot Started | EMA filter ON")
 
     while True:
         try:
@@ -160,50 +154,58 @@ def run_bot():
 
             latest_price = df['close'].iloc[-1]
 
-            # === Compute EMAs ===
+            # Compute EMAs
             df['ema_fast'] = compute_ema(df, period=20)
             df['ema_slow'] = compute_ema(df, period=50)
             ema_fast = df['ema_fast'].iloc[-1]
             ema_slow = df['ema_slow'].iloc[-1]
 
-            # === MONITOR ACTIVE TRADE ===
             monitor_trade(latest_price)
 
-            # === P&F SIGNAL GENERATION ===
             if not trade_active:
                 new_dir, new_boxes, _ = update_pf(latest_price, pf_direction, pf_boxes)
 
                 if pf_direction is not None and new_dir != pf_direction:
-                    print(f"New {new_dir} column started at price {new_boxes[0]}")
+                    print(f"New {new_dir} column started at {new_boxes[0]}")
                 elif pf_direction == new_dir and len(new_boxes) > len(pf_boxes):
                     new_box_count = len(new_boxes)
                     print(f"Added {new_dir} box #{new_box_count} at {new_boxes[-1]}")
 
-                    # EMA trend filter
-                    trend_ok = False
-                    if new_dir == 'X' and ema_fast > ema_slow:
-                        trend_ok = True
-                    elif new_dir == 'O' and ema_fast < ema_slow:
-                        trend_ok = True
+                    # EMA filter
+                    trend_ok = (new_dir == 'X' and ema_fast > ema_slow) or (new_dir == 'O' and ema_fast < ema_slow)
 
                     if new_box_count == ALERT_AT_BOX and (time.time() - last_alert_time) > ALERT_COOLDOWN and trend_ok:
                         entry_price = new_boxes[-1]
                         if new_dir == 'X':
                             sl = entry_price - (SL_BOXES * BOX_SIZE)
                             tp = entry_price + (TP_BOXES * BOX_SIZE)
-                            msg = f"""🔔 BUY XAUUSD (P&F + EMA)
-Entry: {entry_price:.2f}
-SL: {sl:.2f}
-TP: {tp:.2f}
-R:R 1:{TP_BOXES/SL_BOXES:.1f}
-EMA Trend: Bullish
-Box count: {new_box_count}"""
+                            msg = f"🔔 BUY XAUUSD (P&F+EMA)\nEntry {entry_price:.2f}, SL {sl:.2f}, TP {tp:.2f}, Trend Bullish"
                         else:
                             sl = entry_price + (SL_BOXES * BOX_SIZE)
                             tp = entry_price - (TP_BOXES * BOX_SIZE)
-                            msg = f"""🔔 SELL XAUUSD (P&F + EMA)
-Entry: {entry_price:.2f}
-SL: {sl:.2f}
-TP: {tp:.2f}
-R:R 1:{TP_BOXES/SL_BOXES:.1f}
-EMA Trend
+                            msg = f"🔔 SELL XAUUSD (P&F+EMA)\nEntry {entry_price:.2f}, SL {sl:.2f}, TP {tp:.2f}, Trend Bearish"
+                        send_telegram(msg)
+                        last_alert_time = time.time()
+
+                        trade_active = True
+                        trade_entry = entry_price
+                        trade_direction = 'BUY' if new_dir == 'X' else 'SELL'
+                        trade_sl = sl
+                        trade_tp = tp
+                        trade_be_triggered = False
+                        send_telegram(f"📊 Monitoring {trade_direction} @ {trade_entry}")
+
+                pf_direction, pf_boxes = new_dir, new_boxes
+            else:
+                new_dir, new_boxes, _ = update_pf(latest_price, pf_direction, pf_boxes)
+                pf_direction, pf_boxes = new_dir, new_boxes
+
+        except Exception as e:
+            print("Bot loop error:", e)
+            send_telegram(f"⚠️ Bot error: {str(e)[:100]}")
+
+        time.sleep(60)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_server, daemon=True).start()
+    run_bot()
